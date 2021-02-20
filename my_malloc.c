@@ -3,12 +3,22 @@
 #include <limits.h>
 #include <pthread.h>
 
+
 static Header * free_list = NULL; // entry of the free blocks cyclic ll
 static Header base; // the very first Header
-static pthread_mutex_t free_list_mutex = PTHREAD_MUTEX_INITIALIZER; // static mutex lock
+
+
+static pthread_mutex_t free_list_mutex = PTHREAD_MUTEX_INITIALIZER; 
 static pthread_mutex_t sbrk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+
+/* prototypes */
 Header * malloc_sys(size_t n);
+void * processBlock(Header * start, size_t size);
+void ts_sys_free_lock(void * ptr);
+Header * insert_free_list(void * ptr);
+void coalescing_blocks(Header * toAdd, Header * block);
+
 
 /* ts_malloc_lock
  * ---------------
@@ -19,6 +29,7 @@ Header * malloc_sys(size_t n);
  * return: pointer the new space
  */
 void * ts_malloc_lock(size_t size) {
+  pthread_mutex_lock(&free_list_mutex); // lock access to free list 
   size_t sunits = (size + sizeof(Header) - 1) / sizeof(Header) + 1;
   Header * curr = NULL, * prev = free_list;
   unsigned mindiff = UINT_MAX;
@@ -29,7 +40,6 @@ void * ts_malloc_lock(size_t size) {
   }
   curr = prev->next;
   Header * best = NULL, * bestPrev = NULL;
-  pthread_mutex_lock(&free_list_mutex); // lock access to free list
   while (1) {
     if (curr->size >= sunits) {
       if (curr->size == sunits) {
@@ -44,18 +54,22 @@ void * ts_malloc_lock(size_t size) {
         bestPrev = prev;
       }
     }
+    // printf("freelist=%p, curr=%p\n", free_list, curr);
     // done iterating
     if (curr == free_list) { 
       if (best) {
         free_list = bestPrev;
+        void * res = processBlock(best, sunits); 
         pthread_mutex_unlock(&free_list_mutex); // success unlock
-        return processBlock(best, sunits); 
+        return res;
       }
       else {
-          pthread_mutex_unlock(&free_list_mutex); // fail unlock
-          curr = malloc_sys(sunits);
-          if (!curr) return NULL; // OS failed
-          pthread_mutex_lock(&free_list_mutex); // lock free list to search again
+        pthread_mutex_unlock(&free_list_mutex); // fail unlock
+        curr = malloc_sys(sunits);
+        if (!curr) {
+          pthread_mutex_unlock(&free_list_mutex);
+          return NULL;
+        }  // OS failed
       }
     }
     prev = curr;
@@ -63,6 +77,17 @@ void * ts_malloc_lock(size_t size) {
   }
 }
 
+
+/* processBlock
+ * -------------
+ * allocate from a suitable sized block by chopping memory of size 'size'
+ * and update related Header data.
+ * 
+ * start: the header of block to be chopped allocated
+ * size: size of memory in request
+ * 
+ * return: the pointer to the memory following the chopped out block
+ */
 void * processBlock(Header * start, size_t size) {
   start->size -= size;
   start += start->size;
@@ -83,10 +108,6 @@ void * processBlock(Header * start, size_t size) {
  * return: new free list starting pointer
  */
 Header * malloc_sys(size_t num_units) {
-  if (num_units < MIN_ALLOC) {
-    unsigned num = MIN_ALLOC / num_units;
-    num_units *= num;
-  }
   pthread_mutex_lock(&sbrk_mutex); // sbrk lock
   char * ptr = sbrk(num_units * sizeof(Header));
   pthread_mutex_unlock(&sbrk_mutex); // sbrk unlock
@@ -95,21 +116,51 @@ Header * malloc_sys(size_t num_units) {
   }
   Header * header = (Header *)ptr;
   header->size = num_units;
-  pthread_mutex_lock(&free_list_mutex); // locking free_list: insert & search again
-  ts_free_lock((void *)(header + 1));
+  ts_sys_free_lock((void *)(header + 1));
   return free_list;
 }
 
 
 /* ts_free_lock
- * --------
- * actual implementation of free operation. Since the free list is address sorted
- * cyclic linked list, this functions find the position of the free space and do
- * necessary coalescing with adjacent blocks.
+ * ------------
+ * Public thread-safe free operation for external free call.
+ * Thread safety is achieved by using pthread mutex lock.
  *
  * ptr: space to be free and inserted into free list
  */
 void ts_free_lock(void * ptr) {
+  pthread_mutex_lock(&free_list_mutex); // locking free_list: insert & search again
+  insert_free_list(ptr);
+  // free_list = insert_free_list(ptr);
+  pthread_mutex_unlock(&free_list_mutex);
+}
+
+
+/* ts_sys_free_lock
+ * -----------------
+ * Private thread-safe free operation used after calling sbrk to insert
+ * a new allocated block into the free list. The mutex will not be 
+ * immediately unlocked until the block is allocated to user.
+ * 
+ * ptr: space to be free and inserted into free list
+ */
+void ts_sys_free_lock(void * ptr) {
+  pthread_mutex_lock(&free_list_mutex);
+  insert_free_list(ptr);
+}
+
+
+/* insert_free_list
+ * ----------------
+ * Take a pointer to a block of memory and insert it to the free list
+ * managed by my_malloc. Searching the free list arena to find the right
+ * place according to its address. The list is address-sorted.
+ * 
+ * ptr: pointer to the block of memory to insert
+ * 
+ * return: the header to a managed memory block
+ */
+Header * insert_free_list(void * ptr) {
   Header * toAdd = (Header *)ptr - 1;
   Header * temp = free_list;
   while (1) {
@@ -119,19 +170,35 @@ void ts_free_lock(void * ptr) {
     }
     temp = temp->next;
   }
-  if (toAdd + toAdd->size == temp->next) { // upper coalescing
-    toAdd->size += temp->next->size;
-    toAdd->next = temp->next->next;
+  coalescing_blocks(toAdd, temp);
+  return temp;
+}
+
+
+/* coalescing_blocks
+ * -----------------
+ * While inserting block into the free list, coalescing with adjacent 
+ * blocks if possible
+ * 
+ * toAdd:
+ * block:
+ * 
+ * return:
+ */
+void coalescing_blocks(Header * toAdd, Header * block) {
+  if (toAdd + toAdd->size == block->next) { // upper coalescing
+    toAdd->size += block->next->size;
+    toAdd->next = block->next->next;
   }
   else {
-    toAdd->next = temp->next;
+    toAdd->next = block->next;
   }
-  if (toAdd == temp + temp->size) { // lower coalescing
-    temp->size += toAdd->size;
-    temp->next = toAdd->next;
+  if (toAdd == block + block->size) { // lower coalescing
+    block->size += toAdd->size;
+    block->next = toAdd->next;
   }
   else {
-    temp->next = toAdd;
+    block->next = toAdd;
   }
-  free_list = temp;
+  free_list = block;
 }

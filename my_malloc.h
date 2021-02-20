@@ -1,7 +1,6 @@
 #ifndef MY_MEM_ALLOC
 #define MY_MEM_ALLOC
 #include <unistd.h>
-#define MIN_ALLOC 2048 // minimum allocation of memory block
 
 typedef double align; // alignment type
 typedef union header_t { // free list data structure

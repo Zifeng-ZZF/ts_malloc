@@ -13,8 +13,8 @@
 #define FREE(p)    ts_free_nolock(p)
 #endif
 
-#define NUM_THREADS  4
-#define NUM_ITEMS    10000
+#define NUM_THREADS  6
+#define NUM_ITEMS    5000
 
 pthread_t threads[NUM_THREADS];
 int       thread_id[NUM_THREADS];
@@ -33,7 +33,7 @@ malloc_list_t malloc_items[NUM_THREADS * NUM_ITEMS];
 
 void do_allocate(int thread_id) {
   int i, index;
-  int counter = thread_id * NUM_ITEMS;
+  int counter = 0;
   int thread_start_index = thread_id * NUM_ITEMS;
 
   //Let all threads get up and running
@@ -45,11 +45,10 @@ void do_allocate(int thread_id) {
     malloc_items[index].address = (int *)MALLOC(malloc_items[index].bytes);
     malloc_items[index].free = 0;
 
-    if ((i % 10) == 0) { //Occasionally free some items
-      FREE(malloc_items[counter].address);
-      malloc_items[counter].free = 1;
-      counter++;
-    } //if
+    /* if ((i % 100) == 0) { //Occasionally free some items */
+    /*   FREE(malloc_items[counter].address); */
+    /*   malloc_items[counter].free = 1; */
+    /* } //if */
   } //for i
 
   pthread_barrier_wait(&barrier);
@@ -122,9 +121,7 @@ int main(int argc, char *argv[])
   } //else
 
   for (i=0; i < NUM_THREADS * NUM_ITEMS; i++) {
-    if (malloc_items[i].free == 0) {
-      FREE(malloc_items[i].address);
-    } //if
+    FREE(malloc_items[i].address);
   } //for i
 
   return 0;

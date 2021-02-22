@@ -4,20 +4,28 @@
 #include <pthread.h>
 
 
+// free list data
 static Header * free_list = NULL; // entry of the free blocks cyclic ll
 static Header base; // the very first Header
 
 
+// mutexes
 static pthread_mutex_t free_list_mutex = PTHREAD_MUTEX_INITIALIZER; 
 static pthread_mutex_t sbrk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-/* prototypes */
-Header * malloc_sys(size_t n);
+// TLS static data
+static __thread Header * tls_free_list = NULL;
+static __thread Header tls_base;
+
+
+// prototypes
+Header * malloc_sys(size_t n, Header ** fl, int need);
 void * processBlock(Header * start, size_t size);
 void ts_sys_free_lock(void * ptr);
-Header * insert_free_list(void * ptr);
-void coalescing_blocks(Header * toAdd, Header * block);
+void insert_free_list(void * ptr, Header ** fl);
+void coalescing_blocks(Header * toAdd, Header * block, Header ** fl);
+void * my_malloc(size_t n, Header ** fl, int need_lock);
 
 
 /* ts_malloc_lock
@@ -26,55 +34,11 @@ void coalescing_blocks(Header * toAdd, Header * block);
  * smallest block that fits. If no such block found, ask OS for space.
  *
  * size: number of bytes
+ * 
  * return: pointer the new space
  */
 void * ts_malloc_lock(size_t size) {
-  pthread_mutex_lock(&free_list_mutex); // lock access to free list 
-  size_t sunits = (size + sizeof(Header) - 1) / sizeof(Header) + 1;
-  Header * curr = NULL, * prev = free_list;
-  unsigned mindiff = UINT_MAX;
-  if (prev == NULL) { // first time malloc
-    prev = free_list = &base;
-    base.size = 0;
-    base.next = free_list;
-  }
-  curr = prev->next;
-  Header * best = NULL, * bestPrev = NULL;
-  while (1) {
-    if (curr->size >= sunits) {
-      if (curr->size == sunits) {
-        prev->next = curr->next;
-        free_list = prev;
-        pthread_mutex_unlock(&free_list_mutex); // success unlock
-        return (void *)(curr + 1);
-      }
-      else if (curr->size - sunits < mindiff) {
-        mindiff = curr->size - sunits;
-        best = curr;
-        bestPrev = prev;
-      }
-    }
-    // printf("freelist=%p, curr=%p\n", free_list, curr);
-    // done iterating
-    if (curr == free_list) { 
-      if (best) {
-        free_list = bestPrev;
-        void * res = processBlock(best, sunits); 
-        pthread_mutex_unlock(&free_list_mutex); // success unlock
-        return res;
-      }
-      else {
-        pthread_mutex_unlock(&free_list_mutex); // fail unlock
-        curr = malloc_sys(sunits);
-        if (!curr) {
-          pthread_mutex_unlock(&free_list_mutex);
-          return NULL;
-        }  // OS failed
-      }
-    }
-    prev = curr;
-    curr = curr->next;
-  }
+  my_malloc(size, &free_list, 1);
 }
 
 
@@ -105,9 +69,15 @@ void * processBlock(Header * start, size_t size) {
  * requested number of header.
  *
  * num_units: number of header-sized units
+ * fl: double pointer to the entry node of the list
+ * need: use of lock or not
+ * 
  * return: new free list starting pointer
  */
-Header * malloc_sys(size_t num_units) {
+Header * malloc_sys(size_t num_units, Header ** fl, int need) {
+  if (need) {
+    pthread_mutex_unlock(&free_list_mutex); 
+  }
   pthread_mutex_lock(&sbrk_mutex); // sbrk lock
   char * ptr = sbrk(num_units * sizeof(Header));
   pthread_mutex_unlock(&sbrk_mutex); // sbrk unlock
@@ -116,8 +86,14 @@ Header * malloc_sys(size_t num_units) {
   }
   Header * header = (Header *)ptr;
   header->size = num_units;
-  ts_sys_free_lock((void *)(header + 1));
-  return free_list;
+  header->tid = pthread_self();
+  if (need) {
+    ts_sys_free_lock((void *)(header + 1));
+  }
+  else {
+    insert_free_list((void *)(header + 1), fl);
+  }
+  return *fl;
 }
 
 
@@ -130,7 +106,7 @@ Header * malloc_sys(size_t num_units) {
  */
 void ts_free_lock(void * ptr) {
   pthread_mutex_lock(&free_list_mutex); // locking free_list: insert & search again
-  insert_free_list(ptr);
+  insert_free_list(ptr, &free_list);
   // free_list = insert_free_list(ptr);
   pthread_mutex_unlock(&free_list_mutex);
 }
@@ -146,7 +122,7 @@ void ts_free_lock(void * ptr) {
  */
 void ts_sys_free_lock(void * ptr) {
   pthread_mutex_lock(&free_list_mutex);
-  insert_free_list(ptr);
+  insert_free_list(ptr, &free_list);
 }
 
 
@@ -157,12 +133,14 @@ void ts_sys_free_lock(void * ptr) {
  * place according to its address. The list is address-sorted.
  * 
  * ptr: pointer to the block of memory to insert
- * 
- * return: the header to a managed memory block
+ * fl: double pointer to the entry node of the list
  */
-Header * insert_free_list(void * ptr) {
+void insert_free_list(void * ptr, Header ** fl) {
   Header * toAdd = (Header *)ptr - 1;
-  Header * temp = free_list;
+  if (toAdd->tid != pthread_self()) {
+    return;
+  }
+  Header * temp = *fl;
   while (1) {
     if ((toAdd > temp && toAdd < temp->next) // inside the arena
     || (temp >= temp->next && (toAdd > temp || toAdd < temp->next))) { // outside
@@ -170,8 +148,7 @@ Header * insert_free_list(void * ptr) {
     }
     temp = temp->next;
   }
-  coalescing_blocks(toAdd, temp);
-  return temp;
+  coalescing_blocks(toAdd, temp, fl);
 }
 
 
@@ -180,12 +157,11 @@ Header * insert_free_list(void * ptr) {
  * While inserting block into the free list, coalescing with adjacent 
  * blocks if possible
  * 
- * toAdd:
- * block:
- * 
- * return:
+ * toAdd: block to be inserted
+ * block: block in the free list
+ * fl: double pointer to the entry node of the list
  */
-void coalescing_blocks(Header * toAdd, Header * block) {
+void coalescing_blocks(Header * toAdd, Header * block, Header ** fl) {
   if (toAdd + toAdd->size == block->next) { // upper coalescing
     toAdd->size += block->next->size;
     toAdd->next = block->next->next;
@@ -200,5 +176,116 @@ void coalescing_blocks(Header * toAdd, Header * block) {
   else {
     block->next = toAdd;
   }
-  free_list = block;
+  *fl = block;
+}
+
+
+/* ts_malloc_nolock
+ * -----------------
+ * Allocate memory with n bytes without using lock to achieve thread-safe malloc
+ * 
+ * n: in bytes of requested memory
+ */
+void * ts_malloc_nolock(size_t n) { 
+  my_malloc(n, &tls_free_list, 0);
+}
+
+
+/* ts_free_nolock
+ * -----------------
+ * Return the memory from user to the free list in a lock-free thread safe way
+ * 
+ * ptr: pointer to memory to return to free list
+ */
+void ts_free_nolock(void * ptr) {
+  insert_free_list(ptr, &tls_free_list);
+}
+
+
+/* initialize_alloc
+ * ----------------
+ * First time malloc setup. Setup the arena using a base header. Make TLS or
+ * Lock version based on need_lock
+ * 
+ * prev: double pointer to prev node of current node
+ * need_lock: indicate use of lock or not
+ * fl: double pointer to list entry node
+ */
+void initialize_alloc(Header ** prev, int need_lock, Header ** fl) {
+  if (need_lock) {
+    *prev = *fl = &base;
+    base.size = 0;
+    base.next = *fl;
+    base.tid = pthread_self();
+  }
+  else {
+    *prev = *fl = &tls_base;
+    tls_base.size = 0;
+    tls_base.next = *fl;
+    tls_base.tid = pthread_self();
+  }
+}
+
+
+/* my_malloc
+ * ---------
+ * The actual memory allocator main logic. Search the free list for suitable
+ * block and return a chopped block if found. Ask OS for more heap if no such
+ * block found. If need lock, the acquire/free lock operations will be on.
+ * 
+ * n: size in bytes of requested memo
+ * fl: double pointer to the entry node of the list
+ * need_lock: indicate use of lock or not
+ * 
+ * return: pointer to the allocated memory
+ */
+void * my_malloc(size_t n, Header ** fl, int need_lock) {
+  if (need_lock) {
+    pthread_mutex_lock(&free_list_mutex); // lock access to free list 
+  }
+  size_t sunits = (n + sizeof(Header) - 1) / sizeof(Header) + 1;
+  Header * curr = NULL, * prev = *fl;
+  unsigned mindiff = UINT_MAX;
+  if (prev == NULL) {
+    initialize_alloc(&prev, need_lock, fl);
+  }
+  curr = prev->next;
+  Header * best = NULL, * bestPrev = NULL;
+  while (1) {
+    if (curr->size >= sunits) {
+      if (curr->size == sunits) {
+        prev->next = curr->next;
+        *fl = prev;
+        if (need_lock) {
+          pthread_mutex_unlock(&free_list_mutex); // success unlock
+        }
+        return (void *)(curr + 1);
+      }
+      else if (curr->size - sunits < mindiff) {
+        mindiff = curr->size - sunits;
+        best = curr;
+        bestPrev = prev;
+      }
+    }
+    if (curr == *fl) { // done one iteration
+      if (best) {
+        *fl = bestPrev;
+        void * res = processBlock(best, sunits); 
+        if (need_lock) {
+          pthread_mutex_unlock(&free_list_mutex); // success unlock
+        }
+        return res;
+      }
+      else {
+        if ((curr = malloc_sys(sunits, fl, need_lock)) == NULL) {
+          if (need_lock) {
+            pthread_mutex_unlock(&free_list_mutex);
+          }
+          return NULL;
+        }
+      }
+    }
+    prev = curr;
+    curr = curr->next;
+  }
 }

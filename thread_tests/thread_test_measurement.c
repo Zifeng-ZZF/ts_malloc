@@ -8,15 +8,17 @@
 #ifdef LOCK_VERSION
 #define MALLOC(sz) ts_malloc_lock(sz)
 #define FREE(p)    ts_free_lock(p)
+char * s = "Testing lock version.....";
 #endif
 #ifdef NOLOCK_VERSION
 #define MALLOC(sz) ts_malloc_nolock(sz)
 #define FREE(p)    ts_free_nolock(p)
+char * s = "Testing TLS version......";
 #endif
 
-#define NUM_THREADS  4
-#define NUM_ITEMS    20000
-
+#define NUM_THREADS  2
+#define NUM_ITEMS    40000 
+ 
 double calc_time(struct timespec start, struct timespec end) {
   double start_sec = (double)start.tv_sec*1000000000.0 + (double)start.tv_nsec;
   double end_sec = (double)end.tv_sec*1000000000.0 + (double)end.tv_nsec;
@@ -60,7 +62,7 @@ void do_allocate(int thread_id) {
   for (i=0; i < NUM_ITEMS; i++) {
     index = i + thread_start_index;
     malloc_items[index].address = (int *)MALLOC(malloc_items[index].bytes);
-    malloc_items[index].free = 0;
+    malloc_items[index].free = 0; 
 
     if ((thread_id % 2) == 0) {
       if ((i % 4) == 0) { //Occasionally free some items
@@ -93,6 +95,9 @@ void *allocate(void *arg) {
 
 int main(int argc, char *argv[])
 {
+#if defined(LOCK_VERSION) || defined(NOLOCK_VERSION)
+  printf("%s\n", s);
+#endif
   int i, j;
   struct timespec start_time, end_time;
   void *start_segment_addr, *end_segment_addr;

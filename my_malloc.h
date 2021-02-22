@@ -1,12 +1,14 @@
 #ifndef MY_MEM_ALLOC
 #define MY_MEM_ALLOC
 #include <unistd.h>
+#include <pthread.h>
 
 typedef double align; // alignment type
 typedef union header_t { // free list data structure
   struct {
     union header_t * next;
     size_t size;
+    pthread_t tid;
   };
   align al; // not used, simply for alignment
 } Header;
